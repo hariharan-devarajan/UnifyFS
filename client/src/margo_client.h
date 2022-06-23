@@ -37,6 +37,7 @@ typedef struct ClientRpcIds {
     hg_id_t laminate_id;
     hg_id_t fsync_id;
     hg_id_t mread_id;
+    hg_id_t node_local_extents_get_id;
 
     /* server-to-client */
     hg_id_t heartbeat_id;
@@ -103,5 +104,10 @@ int invoke_client_truncate_rpc(unifyfs_client* client,
 int invoke_client_unlink_rpc(unifyfs_client* client,
                              int gfid);
 
+int invoke_client_node_local_extents_get_rpc(unifyfs_client* client,
+                                             int num_req,
+                                             extents_list_t* read_req,
+                                             size_t* extent_count,
+                                             unifyfs_client_index_t** extents);
 
 #endif // MARGO_CLIENT_H
