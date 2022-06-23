@@ -14,6 +14,7 @@
 
 #include "unifyfs_group_rpc.h"
 #include "unifyfs_p2p_rpc.h"
+#include "unifyfs_rpc_util.h"
 
 
 #ifndef UNIFYFS_BCAST_K_ARY
@@ -297,7 +298,7 @@ static void coll_restore_input_bulk(coll_request* coll_req)
     }
 }
 
-static void collective_cleanup(coll_request* coll_req)
+void collective_cleanup(coll_request* coll_req)
 {
     if (NULL == coll_req) {
         return;
@@ -336,10 +337,6 @@ static void collective_cleanup(coll_request* coll_req)
     if (NULL != coll_req->bulk_buf) {
         free(coll_req->bulk_buf);
     }
-
-    /* release communication tree resources */
-    unifyfs_tree_free(&(coll_req->tree));
-    memset(coll_req, 0, sizeof(*coll_req));
     free(coll_req);
 }
 
@@ -369,6 +366,8 @@ static int collective_forward(coll_request* coll_req)
 
     return ret;
 }
+
+
 
 /* set collective output return value to local result value */
 void collective_set_local_retval(coll_request* coll_req, int val)
@@ -416,8 +415,7 @@ void collective_set_local_retval(coll_request* coll_req, int val)
     }
 }
 
-/* finish collective process by waiting for any child responses and
- * sending parent response (if applicable) */
+/* Forward the collective request to any children */
 int collective_finish(coll_request* coll_req)
 {
     int ret = UNIFYFS_SUCCESS;
@@ -442,6 +440,8 @@ int collective_finish(coll_request* coll_req)
                coll_req, (int)(coll_req->req_type));
     }
 
+    collective_cleanup(coll_req);
+
     return ret;
 }
 
@@ -462,9 +462,10 @@ int invoke_bcast_progress_rpc(coll_request* coll_req)
     }
 
     /* get handle to local rpc function */
+    hg_handle_t handle;
     hg_id_t hgid = unifyfsd_rpc_context->rpcs.bcast_progress_id;
     hg_return_t hret = margo_create(unifyfsd_rpc_context->svr_mid, addr,
-                                    hgid, &(coll_req->progress_hdl));
+                                    hgid, &handle);
     if (hret != HG_SUCCESS) {
         LOGERR("failed to get handle for bcast progress  - %s",
                HG_Error_to_string(hret));
@@ -474,8 +475,7 @@ int invoke_bcast_progress_rpc(coll_request* coll_req)
          * by a ULT */
         bcast_progress_in_t in;
         in.coll_req = (hg_ptr_t) coll_req;
-        hret = margo_iforward(coll_req->progress_hdl, &in,
-                              &(coll_req->progress_req));
+        hret = margo_forward(handle, &in);
         if (hret != HG_SUCCESS) {
             LOGERR("failed to forward bcast progress for coll(%p) - %s",
                    HG_Error_to_string(hret), coll_req);
@@ -491,7 +491,6 @@ static void bcast_progress_rpc(hg_handle_t handle)
 {
     /* assume we'll succeed */
     int32_t ret = UNIFYFS_SUCCESS;
-    coll_request* coll = NULL;
 
     bcast_progress_in_t in;
     hg_return_t hret = margo_get_input(handle, &in);
@@ -500,7 +499,7 @@ static void bcast_progress_rpc(hg_handle_t handle)
         ret = UNIFYFS_ERROR_MARGO;
     } else {
         /* call collective_finish() to progress bcast operation */
-        coll = (coll_request*) in.coll_req;
+        coll_request* coll = (coll_request*) in.coll_req;
         LOGDBG("BCAST_RPC: bcast progress collective(%p)", coll);
         ret = collective_finish(coll);
         if (ret != UNIFYFS_SUCCESS) {
@@ -515,10 +514,6 @@ static void bcast_progress_rpc(hg_handle_t handle)
     hret = margo_respond(handle, &out);
     if (hret != HG_SUCCESS) {
         LOGERR("margo_respond() failed - %s", HG_Error_to_string(hret));
-    }
-
-    if (NULL != coll) {
-        collective_cleanup(coll);
     }
 
     /* free margo resources */
@@ -924,20 +919,40 @@ int unifyfs_invoke_broadcast_transfer(int client_app,
     /* assuming success */
     int ret = UNIFYFS_SUCCESS;
 
+    /* get attributes and extents metadata */
+    unifyfs_file_attr_t attrs;
+    ret = unifyfs_inode_metaget(gfid, &attrs);
+    if (ret != UNIFYFS_SUCCESS) {
+        LOGERR("failed to get file attributes for gfid=%d", gfid);
+        return ret;
+    }
+
+    if (!attrs.is_shared) {
+        /* no need to broadcast for private files */
+        LOGDBG("gfid=%d is private, not broadcasting", gfid);
+        return UNIFYFS_SUCCESS;
+    }
+
+    ret = sm_transfer(glb_pmi_rank, client_app, client_id, transfer_id, gfid,
+                      transfer_mode, dest_file, NULL);
+    if (ret != UNIFYFS_SUCCESS) {
+        LOGERR("sm_transfer() at root failed for gfid=%d", gfid);
+        return ret;
+    }
+
     LOGDBG("BCAST_RPC: starting transfer(mode=%d) for gfid=%d to file %s",
            transfer_mode, gfid, dest_file);
 
     coll_request* coll = NULL;
     transfer_bcast_in_t* in = calloc(1, sizeof(*in));
-    server_rpc_req_t* req = calloc(1, sizeof(*req));
-    if ((NULL == in) || (NULL == req)) {
+    if (NULL == in) {
         ret = ENOMEM;
     } else {
         /* set input params */
         in->root        = (int32_t) glb_pmi_rank;
         in->gfid        = (int32_t) gfid;
         in->mode        = (int32_t) transfer_mode;
-        in->dst_file    = (hg_const_string_t) strdup(dest_file);
+        in->dst_file    = (hg_const_string_t) dest_file;
 
         hg_id_t op_hgid = unifyfsd_rpc_context->rpcs.transfer_bcast_id;
         server_rpc_e rpc = UNIFYFS_SERVER_BCAST_RPC_TRANSFER;
@@ -948,21 +963,9 @@ int unifyfs_invoke_broadcast_transfer(int client_app,
         if (NULL == coll) {
             ret = ENOMEM;
         } else {
-            int rc = collective_forward(coll);
-            if (rc == UNIFYFS_SUCCESS) {
-                coll->app_id = client_app;
-                coll->client_id = client_id;
-                coll->client_req_id = transfer_id;
-                req->req_type = rpc;
-                req->coll = coll;
-                req->handle = HG_HANDLE_NULL;
-                req->input = (void*) in;
-                req->bulk_buf = NULL;
-                req->bulk_sz = 0;
-                ret = sm_submit_service_request(req);
-                if (ret != UNIFYFS_SUCCESS) {
-                    LOGERR("failed to submit coll request to svcmgr");
-                }
+            ret = collective_forward(coll);
+            if (ret == UNIFYFS_SUCCESS) {
+                ret = invoke_bcast_progress_rpc(coll);
             }
         }
     }

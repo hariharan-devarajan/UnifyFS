@@ -41,6 +41,8 @@
 #include "unifyfs_group_rpc.h"
 #include "unifyfs_p2p_rpc.h"
 #include "unifyfs_server_rpcs.h"
+#include "seg_tree.h"
+#include "unifyfs_rpc_util.h"
 
 
 #define RM_LOCK(rm) \
@@ -83,6 +85,8 @@ do { \
  * data has been received, the request manager signals the client
  * to process the read replies. It iterates with the client until
  * all incoming read replies have been transferred. */
+
+typedef struct extents_list extents_list;
 
 /* Create a request manager thread for the application client
  * corresponding to the given app_id and client_id.
@@ -1440,6 +1444,94 @@ static int process_unlink_rpc(reqmgr_thrd_t* reqmgr,
     return ret;
 }
 
+static int process_node_local_extents_get_rpc(reqmgr_thrd_t* reqmgr,
+                                              client_rpc_req_t* req)
+{
+    int ret = UNIFYFS_SUCCESS;
+    unifyfs_node_local_extents_get_in_t* in = req->input;
+    assert(in != NULL);
+    size_t num_req = in->num_req;
+    void* buffer = pull_margo_bulk_buffer(req->handle, in->bulk_data,
+                                          in->bulk_size, NULL);
+
+
+    unifyfs_extent_t* in_extents = (unifyfs_extent_t*) buffer;
+    struct extents_list out_list;
+    struct extents_list* out_list_cur = &out_list;
+    int total_chunks = 0;
+    bool add_node = false;
+    for (int i = 0; i < num_req; ++i) {
+        LOGDBG("getting node local extent for gfid=%d", in_extents[i].gfid);
+        unsigned int n_chunks = 0;
+        chunk_read_req_t* chunks = NULL;
+        int rc = unifyfs_invoke_find_extents_rpc(in_extents[i].gfid, 1,
+                                                 &in_extents[i],
+                                                 &n_chunks, &chunks);
+        if (!rc) {
+            if (add_node) {
+                out_list_cur->next = calloc(1, sizeof(struct extents_list));
+                out_list_cur = out_list_cur->next;
+            }
+            for (int i = 0; i < n_chunks; ++i) {
+                out_list_cur->value.file_pos = chunks[i].offset;
+                out_list_cur->value.log_pos = chunks[i].log_offset;
+                out_list_cur->value.length = chunks[i].nbytes;
+                out_list_cur->value.gfid = in_extents[i].gfid;
+                out_list_cur->value.log_app_id = chunks[i].log_app_id;
+                out_list_cur->value.log_client_id = chunks[i].log_client_id;
+                if (i < n_chunks - 1) {
+                    out_list_cur->next = calloc(1, sizeof(struct extents_list));
+                    out_list_cur = out_list_cur->next;
+                } else {
+                    out_list_cur->next = NULL;
+                }
+            }
+            add_node = true;
+            total_chunks += n_chunks;
+            free(chunks);
+        }
+    }
+    margo_free_input(req->handle, in);
+    free(in);
+    free(buffer);
+    /* prepare the response for node local extents get */
+    unifyfs_node_local_extents_get_out_t out;
+    hg_return_t hret = 0;
+    out.ret = (int32_t) ret;
+    out.extent_count = total_chunks;
+    size_t extents_size = total_chunks*sizeof(unifyfs_client_index_t);
+    unifyfs_client_index_t* extents_buffer =
+            malloc(extents_size);
+    extents_list* cur = &out_list;
+    for (int i = 0; i < total_chunks; ++i) {
+        extents_buffer[i].file_pos = cur->value.file_pos;
+        extents_buffer[i].length = cur->value.length;
+        extents_buffer[i].gfid = cur->value.gfid;
+        cur = cur->next;
+    }
+    hret = margo_bulk_create(unifyfsd_rpc_context->shm_mid,
+                             1, (void**) &extents_buffer, &extents_size,
+                             HG_BULK_READ_ONLY, &out.bulk_data);
+    out.bulk_size = extents_size;
+
+    /* send rpc response */
+    hret = margo_respond(req->handle, &out);
+    if (hret != HG_SUCCESS) {
+        LOGERR("margo_respond() failed");
+    }
+    if (hret != HG_SUCCESS) {
+        LOGERR("margo_bulk_free() failed");
+    }
+    free(extents_buffer);
+    /* margo_forward serializes all data before returning,
+     * and it's safe to free the rpc params */
+    margo_bulk_free(out.bulk_data);
+    /* cleanup req */
+    margo_destroy(req->handle);
+    return ret;
+}
+
+
 /* iterate over list of chunk reads and send responses */
 static int rm_process_client_requests(reqmgr_thrd_t* reqmgr)
 {
@@ -1504,6 +1596,9 @@ static int rm_process_client_requests(reqmgr_thrd_t* reqmgr)
             break;
         case UNIFYFS_CLIENT_RPC_UNLINK:
             rret = process_unlink_rpc(reqmgr, req);
+            break;
+        case UNIFYFS_CLIENT_RPC_NODE_LOCAL_EXTENTS_GET:
+            rret = process_node_local_extents_get_rpc(reqmgr, req);
             break;
         default:
             LOGERR("unsupported client rpc request type %d", req->req_type);
